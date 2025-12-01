@@ -3,12 +3,14 @@ import math
 import json
 import random
 from typing import Dict, List, Tuple
-
+import time
+from datetime import datetime
 import numpy as np
 import torch
 import wfdb
 from scipy.signal import butter, filtfilt, stft
 from tqdm import tqdm
+import pandas as pd
 
 # ===================== Config =====================
 FS = 360
@@ -32,6 +34,14 @@ STFT_WINDOW = "boxcar"
 STFT_BOUNDARY = None
 STFT_PADDED = False
 
+# Hằng số filter (để lưu vào log)
+HP_CUTOFF = 0.67
+LP_CUTOFF = 100.0
+
+# Log: Khởi tạo biến để lưu log và thời gian
+START_TIME_PROCESSOR = time.time()
+ALL_RECORDS_LOG = []
+
 # Seed cố định
 SEED = 42
 random.seed(SEED)
@@ -42,7 +52,8 @@ torch.manual_seed(SEED)
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-def bandpass_hp_lp(x: np.ndarray, fs: int = FS, low_hz: float = 0.67, high_hz: float = 100.0):
+def bandpass_hp_lp(x: np.ndarray, fs: int = FS, low_hz: float = HP_CUTOFF, high_hz: float = LP_CUTOFF):
+    # Giữ nguyên logic lọc
     nyq = 0.5 * fs
     b_hp, a_hp = butter(4, low_hz / nyq, btype="highpass")
     y = filtfilt(b_hp, a_hp, x)
@@ -54,7 +65,8 @@ def read_mitbih_record(data_dir: str, rec_name: str):
     fs = int(rec.fs)
     if fs != FS:
         raise ValueError(f"{rec_name}: fs={fs}, expected {FS}")
-    sig = rec.p_signal[:, 0].astype(np.float64)
+    # Đọc kênh đầu tiên (thường là MLII)
+    sig = rec.p_signal[:, 0].astype(np.float64) 
     return sig, fs
 
 def read_nstdb(noise_dir: str) -> Dict[str, np.ndarray]:
@@ -92,34 +104,78 @@ def compute_stft_ri(x: np.ndarray):
     )
     return np.vstack([np.real(Z), np.imag(Z)]).astype(np.float32), f, t
 
+# ===== Hàm tính SNR ước tính (dùng cho tín hiệu SẠCH) =====
+def compute_snr_estimate(signal: np.ndarray) -> Tuple[float, float]:
+    """Ước tính SNR theo độ lệch chuẩn. Giả định noise là phần còn lại sau khi lọc baseline/lowpass."""
+    if len(signal) < 1000:
+        return 0.0, 0.0
+
+    # Lọc baseband: Sử dụng highpass/bandpass nhẹ để tách tín hiệu ECG
+    nyq = 0.5 * FS
+    b_hp, a_hp = butter(4, 3.0 / nyq, btype="highpass")
+    clean_estimate = filtfilt(b_hp, a_hp, signal) 
+
+    # Noise estimate: Phần còn lại sau khi trừ đi ước tính sạch
+    noise_estimate = signal - clean_estimate
+    
+    # P_signal = mean(clean_estimate^2), P_noise = mean(noise_estimate^2)
+    P_s = np.mean(clean_estimate ** 2) + 1e-12
+    P_n = np.mean(noise_estimate ** 2) + 1e-12
+    
+    snr_db = 10 * np.log10(P_s / P_n)
+    return snr_db, np.sqrt(P_n) # Trả về SNR (dB) và RMS Noise (mV)
+
 # ===================== Core =====================
 def process_record(rec_name: str, clean_sig: np.ndarray, noises: Dict[str, np.ndarray]):
+    # SỬA LỖI: Khai báo global ngay đầu hàm trước khi sử dụng.
+    global ALL_RECORDS_LOG
+    
+    start_time_record = time.time()
+    
+    len_raw = len(clean_sig)
+    
+    # TÍNH SNR ƯỚC TÍNH (TRÊN TÍN HIỆU SẠCH)
+    snr_db_estimate_raw, rms_noise_estimate_raw = compute_snr_estimate(clean_sig)
+    
     clean_filt = bandpass_hp_lp(clean_sig)
+    len_filtered = len(clean_filt)
+    
     segments = segment_nonoverlap(clean_filt)
+    
     energies = [np.sum(clean_filt[s:e] ** 2) for (s, e) in segments]
     if len(energies) == 0:
+        # Ghi log lỗi (tối thiểu)
+        ALL_RECORDS_LOG.append({
+            "record_id": rec_name, "dataset": "MITDB", "fs": FS,
+            "bandpass_params": f"HP:{HP_CUTOFF}Hz, LP:{LP_CUTOFF}Hz",
+            "segment_len": SEG_LEN, "n_segments": 0, "len_raw": len_raw,
+            "runtime_s": f"{time.time() - start_time_record:.3f}", "status": "Too Short/Empty"
+        })
         return None
     p5, p95 = np.percentile(energies, [5, 95])
     kept = [(s, e) for (s, e), en in zip(segments, energies) if p5 <= en <= p95]
-
+    
+    # ... (Giữ nguyên logic chia train/val/test) ...
     rng = random.Random(SEED + hash(rec_name) % (10**6))
     idxs = list(range(len(kept)))
     rng.shuffle(idxs)
-    n_train = int(0.8 * len(kept))
-    n_val = int(0.1 * len(kept))
+    n_kept = len(kept)
+    n_train = int(0.8 * n_kept)
+    n_val = int(0.1 * n_kept)
     train_idx = set(idxs[:n_train])
     val_idx = set(idxs[n_train:n_train + n_val])
 
     train_out, val_out, test_out = {"inputs": [], "targets": [], "meta": []}, {"inputs": [], "targets": [], "meta": []}, {rec_name: {n: {s: {"inputs": [], "targets": [], "meta": []} for s in SNR_LEVELS} for n in NOISE_TYPES}}
     f_ref, t_ref = None, None
 
-    print(f"📊 Processing record {rec_name} ({len(kept)} segments)...")
+    # ... (Giữ nguyên vòng lặp xử lý segment) ...
     for i, (s, e) in enumerate(tqdm(kept, desc=f"{rec_name}", ncols=80)):
         clean_seg = clean_filt[s:e]
         target_ri, f, t = compute_stft_ri(clean_seg)
         if f_ref is None: f_ref, t_ref = f, t
         bucket = "train" if i in train_idx else ("val" if i in val_idx else "test")
-
+        
+        # ... (Giữ nguyên logic thêm nhiễu và lưu input/target/meta) ...
         for nz in NOISE_TYPES:
             noise_seg = choose_noise_slice(noises[nz], SEG_LEN)
             for snr in SNR_LEVELS:
@@ -141,9 +197,33 @@ def process_record(rec_name: str, clean_sig: np.ndarray, noises: Dict[str, np.nd
                     test_out[rec_name][nz][snr]["targets"].append(torch.from_numpy(target_ri))
                     test_out[rec_name][nz][snr]["meta"].append(meta)
 
+    # GHI LOG CHO RECORD NÀY
+    runtime_record = time.time() - start_time_record
+    log_entry = {
+        "record_id": rec_name,
+        "dataset": "MITDB",
+        "fs": FS,
+        "bandpass_params": f"HP:{HP_CUTOFF}Hz, LP:{LP_CUTOFF}Hz, Order:4/5",
+        "stft_params": f"N={STFT_NPERSEG}, OVL={STFT_NOVERLAP}, W={STFT_WINDOW}",
+        "segment_len": SEG_LEN,
+        "n_segments_total": len(segments),
+        "n_segments_kept": n_kept,
+        "n_segments_train": n_train,
+        "n_segments_val": n_val,
+        "n_segments_test": n_kept - n_train - n_val,
+        "len_raw": len_raw,
+        "len_filtered": len_filtered,
+        "snr_estimate_raw_db": f"{snr_db_estimate_raw:.3f}",
+        "rms_noise_estimate_raw": f"{rms_noise_estimate_raw:.3e}",
+        "runtime_s": f"{runtime_record:.3f}",
+    }
+    # Dòng này bị dư thừa vì đã khai báo ở đầu hàm.
+    # global ALL_RECORDS_LOG 
+    ALL_RECORDS_LOG.append(log_entry)
+    
     return train_out, val_out, test_out, f_ref, t_ref
 
-# ===================== Save =====================
+# ... (Giữ nguyên các hàm save_split, save_test_bucket) ...
 def save_split(filename: str, split: Dict, f, t):
     ensure_dir(os.path.dirname(filename) or ".")
     pkg = {"inputs": split["inputs"], "targets": split["targets"], "meta": split["meta"],
@@ -165,11 +245,23 @@ def save_test_bucket(root: str, buckets, f, t):
                        "fs": FS, "seg_len": SEG_LEN}
                 torch.save(pkg, path)
 
+# GHI LOG TỔNG HỢP VÀO CSV
+def log_summary():
+    # Thêm khai báo global ở đây nếu bạn muốn sửa đổi ALL_RECORDS_LOG trong hàm này
+    # Tuy nhiên, chỉ đọc/sử dụng ở đây nên không cần thiết, trừ khi bạn muốn thay đổi cấu trúc của nó
+    # global ALL_RECORDS_LOG 
+    df_log = pd.DataFrame(ALL_RECORDS_LOG)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"MITDB_preprocessing_summary_{timestamp}.csv"
+    df_log.to_csv(log_filename, index=False)
+    print(f"\n📝 Log tổng hợp được lưu tại: {log_filename}")
+
 # ===================== Main =====================
 def main():
     ensure_dir(OUT_DIR)
     ensure_dir(os.path.join(OUT_DIR, "test"))
-
+    
+    # ... (Giữ nguyên logic chính) ...
     noises = read_nstdb(NOISE_DIR)
     all_train, all_val, all_test, f_ref, t_ref = {"inputs": [], "targets": [], "meta": []}, {"inputs": [], "targets": [], "meta": []}, {}, None, None
 
@@ -179,6 +271,7 @@ def main():
         if result is None: 
             continue
         tr, va, te, f, t = result
+        # ... (Giữ nguyên logic gộp train/val/test) ...
         all_train["inputs"].extend(tr["inputs"])
         all_train["targets"].extend(tr["targets"])
         all_train["meta"].extend(tr["meta"])
@@ -193,6 +286,8 @@ def main():
     save_split(os.path.join(OUT_DIR, "val.pt"), all_val, f_ref, t_ref)
     save_test_bucket(os.path.join(OUT_DIR, "test"), all_test, f_ref, t_ref)
 
+    # Sửa file preprocess_info.json để thêm runtime tổng
+    runtime_total = time.time() - START_TIME_PROCESSOR
     with open(os.path.join(OUT_DIR, "preprocess_info.json"), "w") as f:
         json.dump({
             "records": RECORDS,
@@ -200,10 +295,13 @@ def main():
             "snr_levels_db": SNR_LEVELS,
             "fs": FS,
             "seg_len": SEG_LEN,
-            "stft": {"nperseg": STFT_NPERSEG, "noverlap": STFT_NOVERLAP, "window": STFT_WINDOW}
+            "stft": {"nperseg": STFT_NPERSEG, "noverlap": STFT_NOVERLAP, "window": STFT_WINDOW},
+            "total_runtime_s": f"{runtime_total:.3f}", # Thêm runtime tổng
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }, f, indent=2)
 
     print(f"✅ train.pt, val.pt, test saved in: {OUT_DIR}")
+    log_summary() # GHI LOG TỔNG HỢP VÀO CSV
 
 if __name__ == "__main__":
     main()
