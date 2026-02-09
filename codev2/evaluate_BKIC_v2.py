@@ -107,7 +107,7 @@ ECG_ROOT = get_ecg_root()
 DATA_DIR = os.path.join(ECG_ROOT, "datasetBKIC_preprocessed") 
 RAW_DIR  = os.path.join(ECG_ROOT, "datasetBKIC")
 MODEL_DIR = os.path.join(ECG_ROOT, "trained_models")
-SAVE_DIR = os.path.join(ECG_ROOT, "evaluation_outputs_BKIC")
+SAVE_DIR = os.path.join(ECG_ROOT, "evaluation_outputs_BKIC_v2")
 
 print(f"🔄 Clearing old outputs in: {SAVE_DIR}")
 clear_directory(SAVE_DIR)
@@ -186,9 +186,9 @@ for subj in subjects:
     k = n // SEG_LEN
     segments = [(i * SEG_LEN, (i + 1) * SEG_LEN) for i in range(k)]
     
-    # SEGMENT LOOP
-    # We now plot PER SEGMENT instead of concatenating
-    for i, (s, e) in enumerate(segments):
+    reconstructed_chunks = []
+    
+    for (s, e) in segments:
         seg = filtered_norm[s:e]
         
         # 4. STFT -> (22, T_stft)
@@ -206,41 +206,47 @@ for subj in subjects:
         real_FT, imag_FT = split_ri(pred)
         wave_chunk = istft_from_ri(real_FT, imag_FT)
         
-        # ISTFT length adjustment
+        # ISTFT length might be slightly different due to padding/centering, crop to SEG_LEN
         if len(wave_chunk) > SEG_LEN:
             wave_chunk = wave_chunk[:SEG_LEN]
         elif len(wave_chunk) < SEG_LEN:
+            # Should typically match if NPERSEG/NOVERLAP are standard, but handle just in case
             pad = np.zeros(SEG_LEN - len(wave_chunk))
             wave_chunk = np.concatenate([wave_chunk, pad])
             
-        # Get Reference (Raw Unfiltered Normalized) for this segment
-        ref_seg = raw_norm[s:e]
+        reconstructed_chunks.append(wave_chunk)
         
-        # ========================
-        # Save comparison plot (PER SEGMENT)
-        # ========================
-        # Ensure lengths match for plotting (sometimes edge cases exist)
-        plot_len = min(len(ref_seg), len(wave_chunk))
-        ref_plot = ref_seg[:plot_len]
-        wave_plot = wave_chunk[:plot_len]
+    if not reconstructed_chunks:
+        print("   ⚠️ Signal too short for one segment.")
+        continue
         
-        t_axis = np.arange(plot_len) / TARGET_FS
-        
-        plt.figure(figsize=(14,5))
-        # Raw (Unfiltered) = Blue, Denoised = Red
-        plt.plot(t_axis, ref_plot, label="Raw (Resampled, Normalized)", linewidth=0.8, alpha=0.9, color='blue')
-        plt.plot(t_axis, wave_plot, label="Denoised (TFCNN, Normalized)", linewidth=1.0, color='red')
-        plt.title(f"{subj} — Segment {i} — Raw vs Denoised (TFCNN_depth5)")
-        plt.xlabel("Time (s)")
-        plt.ylabel("Amplitude")
-        plt.legend()
-        plt.grid(linestyle="--", alpha=0.5)
-        plt.tight_layout()
+    denoised_norm = np.concatenate(reconstructed_chunks)
+    
+    # Align raw signal for plotting to match denoised length
+    # Note: We use raw_norm (Unfiltered but Normalized) for reference as requested in V2
+    aligned_len = len(denoised_norm)
+    ref_sig = raw_norm[:aligned_len]
+    
+    # ========================
+    # Save comparison plot
+    # ========================
+    t_axis = np.arange(aligned_len) / TARGET_FS
+    
+    plt.figure(figsize=(14,5))
+    # Change: Plot Raw (No Filter) vs Denoised
+    plt.plot(t_axis, ref_sig, label="Raw (Resampled, Normalized)", linewidth=0.8, alpha=0.9, color='blue', linestyle='--')
+    plt.plot(t_axis, denoised_norm, label="Denoised (TFCNN, Normalized)", linewidth=1.0, color='red')
+    plt.title(f"{subj} — Raw vs Denoised (TFCNN_depth5)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.legend()
+    plt.grid(linestyle="--", alpha=0.5)
+    plt.tight_layout()
 
-        out_path = os.path.join(SAVE_DIR, f"{subj}_seg{i:03d}.png")
-        plt.savefig(out_path, dpi=200)
-        plt.close()
+    out_path = os.path.join(SAVE_DIR, f"{subj}_compare.png")
+    plt.savefig(out_path, dpi=200)
+    plt.close()
 
-    print(f"   ✅ Saved segments for {subj}")
+    print(f"   ✅ Saved {out_path}")
 
-print("\n🎯 BKIC Segment Evaluation Completed.")
+print("\n🎯 BKIC Evaluation V2 Completed.")

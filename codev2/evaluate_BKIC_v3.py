@@ -8,7 +8,7 @@ from model_var_depth import HybridSTFT_LIRA_VarDepth as HybridSTFT_LIRA
 import shutil
 
 # ========================
-# CONFIG (Updated for TFCNN_depth5)
+# CONFIG (Updated for TFCNN_depth4)
 # ========================
 # Target config for the Model
 TARGET_FS = 360
@@ -107,14 +107,14 @@ ECG_ROOT = get_ecg_root()
 DATA_DIR = os.path.join(ECG_ROOT, "datasetBKIC_preprocessed") 
 RAW_DIR  = os.path.join(ECG_ROOT, "datasetBKIC")
 MODEL_DIR = os.path.join(ECG_ROOT, "trained_models")
-SAVE_DIR = os.path.join(ECG_ROOT, "evaluation_outputs_BKIC")
+SAVE_DIR = os.path.join(ECG_ROOT, "evaluation_outputs_BKIC_v3")
 
 print(f"🔄 Clearing old outputs in: {SAVE_DIR}")
 clear_directory(SAVE_DIR)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Update to use the TFCNN_depth5 model
-MODEL_PATH = os.path.join(MODEL_DIR, "TFCNN_depth5_best.pth")
+# Update to use the TFCNN_depth4 model
+MODEL_PATH = os.path.join(MODEL_DIR, "TFCNN_depth4_best.pth")
 
 # ========================
 # Load model
@@ -122,15 +122,13 @@ MODEL_PATH = os.path.join(MODEL_DIR, "TFCNN_depth5_best.pth")
 print(f"🔹 Loading model: {MODEL_PATH}")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model config expected by TFCNN_depth5
-# Note: expected_t is flexible in fully conv models usually, but the class might check it.
-# We will set a typical value or what we expect during inference chunks.
+# Model config updated for TFCNN_depth4 (n_blocks=4)
 model = HybridSTFT_LIRA(
     input_channels=1, 
     output_channels=1, 
-    n_blocks=5, 
+    n_blocks=4,  # Changed from 5 to 4
     channels=64, 
-    expected_t=4096 # Placeholder, will be adjusted by model or ignored if flexible
+    expected_t=4096 
 ).to(DEVICE)
 
 try:
@@ -230,7 +228,7 @@ for subj in subjects:
         # Raw (Unfiltered) = Blue, Denoised = Red
         plt.plot(t_axis, ref_plot, label="Raw (Resampled, Normalized)", linewidth=0.8, alpha=0.9, color='blue')
         plt.plot(t_axis, wave_plot, label="Denoised (TFCNN, Normalized)", linewidth=1.0, color='red')
-        plt.title(f"{subj} — Segment {i} — Raw vs Denoised (TFCNN_depth5)")
+        plt.title(f"{subj} — Segment {i} — Raw vs Denoised (TFCNN_depth4)")
         plt.xlabel("Time (s)")
         plt.ylabel("Amplitude")
         plt.legend()
@@ -243,4 +241,4 @@ for subj in subjects:
 
     print(f"   ✅ Saved segments for {subj}")
 
-print("\n🎯 BKIC Segment Evaluation Completed.")
+print("\n🎯 BKIC Segment Evaluation Completed (Depth 4).")
